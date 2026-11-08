@@ -1,0 +1,281 @@
+# Home Assistant Core 2026.11 — termostaty i pokoje dla pilota ESPHome.
+# Zapisz jako /config/packages/pilot_climates.yaml; nie dodawaj kolejnych climate.
+# Termostaty: etykieta "Termostaty pilota" bezposrednio na encjach climate.*.
+# Opcjonalnie oznacz obszary HA etykieta "Pokoje pilota": zastapia liste startowa.
+# Bez oznaczonych obszarow ponizsze configured_rooms okresla kafelki i kolejnosc.
+# Jednostka temperature_unit jest publikowana przez climate w HA 2026.11.
+# temperature: value_milli = zadana temperatura w jednostce HA pomnozona przez 1000.
+script:
+  pilot_climates:
+    alias: Pilot — termostaty
+    description: Pokoje, odczyt temperatur i sterowanie termostatami z HA.
+    mode: queued
+    max: 8
+    fields:
+      operation:
+        name: Operacja
+        default: catalog
+        selector:
+          select:
+            options: [catalog, temperature, hvac, preset]
+      room_id:
+        name: Identyfikator pokoju
+        default: ""
+        selector:
+          text:
+      entity_id:
+        name: Termostat odczytany przez pilota
+        default: ""
+        selector:
+          entity:
+            domain: climate
+      page:
+        name: Strona od zera
+        default: 0
+        selector:
+          number: {min: 0, max: 25000, mode: box}
+      value_milli:
+        name: Temperatura razy 1000
+        default: 0
+        selector:
+          number: {min: -1000000, max: 1000000, step: 1, mode: box}
+      setting:
+        name: Tryb HVAC lub preset
+        default: ""
+        selector:
+          text:
+      request_id:
+        name: Identyfikator zadania
+        default: 0
+        selector:
+          number: {min: 0, max: 4294967295, mode: box}
+    sequence:
+      - variables:
+          # Liste zmieniasz tutaj w HA, nigdy w kodzie pilota.
+          configured_rooms:
+            - {id: salon, name: Salon}
+            - {id: pokoj_babci, name: Pokój babci}
+            - {id: pokoj_balkon, name: Pokój balkon}
+            - {id: sypialnia_rodzice, name: Sypialnia rodzice}
+            - {id: sypialnia_niko, name: Sypialnia Niko}
+            - {id: lazienka_dol, name: Łazienka dół}
+            - {id: lazienka_gora, name: Łazienka góra}
+            - {id: garderoba, name: Garderoba}
+            - {id: spizarka, name: Spiżarka}
+            - {id: korytarz, name: Korytarz}
+          # Reczne przypisanie tylko w razie potrzeby, np.:
+          # thermostat_overrides:
+          #   room.salon: climate.salon
+          #   area.salon: climate.salon
+          # Encja nadal musi miec etykiete "Termostaty pilota".
+          # Bledny jawny wpis nie uruchamia automatycznego dopasowania.
+          thermostat_overrides: {}
+          op: "{{ operation | default('catalog', true) | string | trim | lower }}"
+          selected_room_id: "{{ room_id | default('', true) | string | trim }}"
+          target_id: "{{ entity_id | default('', true) | string | trim }}"
+          # Slownik chroni nazwy presetow np. "17", "True" lub "None"
+          # przed automatyczna konwersja typow skalarnych szablonow HA.
+          requested_setting: "{{ {'value': setting | default('', true)} }}"
+          requested_value: "{{ value_milli | default(none) }}"
+          raw_request_key: "{{ request_id | default(0) }}"
+          request_key: "{{ request_id | int(0) if request_id is defined and request_id is not boolean and is_number(request_id) else 0 }}"
+          requested_page: >-
+            {% set raw_page = page | default(0) %}
+            {{ [0, raw_page | int(0)] | max if raw_page is not boolean and is_number(raw_page) else 0 }}
+          room_label: "{{ label_id('Pokoje pilota') }}"
+          climate_label: "{{ label_id('Termostaty pilota') }}"
+          known_modes: ["off", heat, cool, heat_cool, auto, dry, fan_only]
+          known_actions: [cooling, defrosting, drying, fan, heating, idle, "off", preheating]
+      - variables:
+          member_ids: >-
+            {{ (label_entities(climate_label) if climate_label else [])
+               | select('match', '^climate\\.[a-z0-9_]{1,247}$') | unique | list }}
+          selected_area_ids: >-
+            {{ (label_areas(room_label) if room_label else [])
+               | select('match', '^[a-zA-Z0-9_-]{1,150}$') | unique | list }}
+      - variables:
+          room_definitions: >-
+            {% set ns = namespace(rows=[], seen=[]) %}
+            {% if selected_area_ids | length > 0 %}
+              {% for aid in selected_area_ids %}
+                {% set name = area_name(aid) %}
+                {% if name is string and name | trim != '' %}
+                  {% set ns.rows = ns.rows + [{'id': 'area.' ~ aid, 'name': name, 'area_id': aid}] %}
+                {% endif %}
+              {% endfor %}
+              {% set ns.rows = ns.rows | sort(attribute='name', case_sensitive=false) %}
+            {% elif configured_rooms is sequence and configured_rooms is not string and configured_rooms is not mapping %}
+              {% for room in configured_rooms %}
+                {% if room is mapping and room.get('id') is string and room.get('id') is match('^[a-z0-9_]{1,150}$')
+                      and room.get('name') is string and room.name | trim != '' and room.id not in ns.seen %}
+                  {% set ns.rows = ns.rows + [{'id': 'room.' ~ room.id, 'name': room.name, 'area_id': ''}] %}
+                  {% set ns.seen = ns.seen + [room.id] %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {{ ns.rows }}
+      - variables:
+          room_rows: >-
+            {% set ns = namespace(rows=[]) %}
+            {% for room in room_definitions %}
+              {% set binding = namespace(ids=[], id='', ambiguous=false) %}
+              {% if thermostat_overrides is mapping and room.id in thermostat_overrides %}
+                {% set override = thermostat_overrides[room.id] %}
+                {% if override is string and override in member_ids %}
+                  {% set binding.id = override %}
+                {% endif %}
+              {% else %}
+                {% set area_members = area_entities(room.area_id) if room.area_id else [] %}
+                {% for eid in member_ids %}
+                  {% set entity_area_name = area_name(eid) %}
+                  {% set friendly = state_attr(eid, 'friendly_name') %}
+                  {% if (room.area_id and eid in area_members)
+                        or (not room.area_id and entity_area_name is string and entity_area_name | lower == room.name | lower)
+                        or (not room.area_id and not entity_area_name and friendly is string and friendly | lower == room.name | lower) %}
+                    {% set binding.ids = binding.ids + [eid] %}
+                  {% endif %}
+                {% endfor %}
+                {% if binding.ids | length == 1 %}
+                  {% set binding.id = binding.ids[0] %}
+                {% elif binding.ids | length > 1 %}
+                  {% set binding.ambiguous = true %}
+                {% endif %}
+              {% endif %}
+              {% set eid = binding.id %}
+              {% set state = states(eid) if eid else 'unknown' %}
+              {% set raw_features = state_attr(eid, 'supported_features') if eid else none %}
+              {% set features = raw_features | int if raw_features is not boolean and is_number(raw_features)
+                   and raw_features | float == raw_features | int and 0 <= raw_features | float <= 4294967295 else 0 %}
+              {% set raw_min = state_attr(eid, 'min_temp') if eid else none %}
+              {% set raw_max = state_attr(eid, 'max_temp') if eid else none %}
+              {% set raw_step = state_attr(eid, 'target_temp_step') if eid else none %}
+              {% set minimum = raw_min | float if raw_min is not boolean and is_number(raw_min) and -1000 <= raw_min | float <= 1000 else none %}
+              {% set maximum = raw_max | float if raw_max is not boolean and is_number(raw_max) and -1000 <= raw_max | float <= 1000 else none %}
+              {% set step = raw_step | float if raw_step is not boolean and is_number(raw_step) and 0.001 <= raw_step | float <= 1000 else none %}
+              {% set raw_unit = state_attr(eid, 'temperature_unit') if eid else '°C' %}
+              {% set unit = raw_unit if raw_unit in ['°C','°F'] else '' %}
+              {% set raw_current = state_attr(eid, 'current_temperature') if eid else none %}
+              {% set current = raw_current | float if raw_current is not boolean and is_number(raw_current) and raw_current | float | abs <= 10000 else none %}
+              {% set raw_target = state_attr(eid, 'temperature') if eid else none %}
+              {% set target = raw_target | float if raw_target is not boolean and is_number(raw_target) and raw_target | float | abs <= 10000 else none %}
+              {% set controls = namespace(modes=[], presets=[]) %}
+              {% set raw_modes = state_attr(eid, 'hvac_modes') if eid else none %}
+              {% if raw_modes is sequence and raw_modes is not string and raw_modes is not mapping %}
+                {% for mode in raw_modes %}
+                  {% if mode is string and mode in known_modes and mode not in controls.modes %}
+                    {% set controls.modes = controls.modes + [mode] %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {% set raw_presets = state_attr(eid, 'preset_modes') if eid else none %}
+              {% if (features // 16) % 2 == 1 and raw_presets is sequence and raw_presets is not string and raw_presets is not mapping %}
+                {% for preset in raw_presets %}
+                  {% if preset is string and 0 < preset | length <= 80 and preset not in controls.presets and controls.presets | length < 32 %}
+                    {% set controls.presets = controls.presets + [preset] %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {% set raw_preset = state_attr(eid, 'preset_mode') if eid else none %}
+              {% set preset = raw_preset if raw_preset is string and raw_preset | length <= 80 else '' %}
+              {% set raw_action = state_attr(eid, 'hvac_action') if eid else none %}
+              {% set action = raw_action if raw_action in known_actions else 'unknown' %}
+              {% set can_temperature = (features // 1) % 2 == 1 and unit != '' and minimum is not none and maximum is not none
+                   and maximum > minimum and step is not none and step <= maximum - minimum
+                   and (minimum * 1000 - (minimum * 1000) | round) | abs < 0.00001
+                   and (maximum * 1000 - (maximum * 1000) | round) | abs < 0.00001
+                   and (step * 1000 - (step * 1000) | round) | abs < 0.00001 %}
+              {% set row = {
+                'id': room.id,
+                'name': room.name | truncate(80, true, '', 0),
+                'entity_id': eid,
+                'available': eid != '' and state in known_modes,
+                'state': state if state in known_modes + ['unavailable'] else 'unknown',
+                'action': action,
+                'current': current,
+                'target': target,
+                'min_temp': minimum,
+                'max_temp': maximum,
+                'step': step,
+                'unit': unit,
+                'can_temperature': can_temperature,
+                'hvac_modes': controls.modes,
+                'preset_modes': controls.presets,
+                'preset': preset,
+                'ambiguous': binding.ambiguous
+              } %}
+              {% set ns.rows = ns.rows + [row] %}
+            {% endfor %}
+            {{ ns.rows }}
+      - variables:
+          selected_row: "{{ room_rows | selectattr('id', 'eq', selected_room_id) | first | default(none) }}"
+      - variables:
+          validation_error: >-
+            {% if op not in ['catalog','temperature','hvac','preset'] %}
+              Nieznana operacja
+            {% elif raw_request_key is boolean or not is_number(raw_request_key)
+                      or raw_request_key | float != request_key or request_key < 0 or request_key > 4294967295 %}
+              Bledny identyfikator zadania
+            {% elif op != 'catalog' and selected_row is none %}
+              Pokoj usuniety z listy
+            {% elif op != 'catalog' and (not selected_row.entity_id or target_id != selected_row.entity_id or target_id not in member_ids) %}
+              Zmieniono przypisanie termostatu
+            {% elif op != 'catalog' and not selected_row.available %}
+              Termostat niedostepny
+            {% elif op == 'temperature' %}
+              {% if not selected_row.can_temperature %}
+                Brak regulacji temperatury
+              {% elif requested_value is boolean or not is_number(requested_value)
+                        or requested_value | float != requested_value | int
+                        or requested_value | float | abs > 1000000 %}
+                Bledna temperatura
+              {% else %}
+                {% set value = requested_value | int / 1000 %}
+                {% set steps = (value - selected_row.min_temp) / selected_row.step %}
+                {% if value < selected_row.min_temp - 0.000001 or value > selected_row.max_temp + 0.000001
+                      or (steps - steps | round) | abs > 0.0001 %}
+                  Temperatura poza zakresem lub krokiem
+                {% endif %}
+              {% endif %}
+            {% elif op == 'hvac' and (requested_setting.value is not string or requested_setting.value not in selected_row.hvac_modes) %}
+              Nieobslugiwany tryb HVAC
+            {% elif op == 'preset' and (requested_setting.value is not string or requested_setting.value not in selected_row.preset_modes) %}
+              Nieobslugiwany preset
+            {% endif %}
+      - choose:
+          - conditions: "{{ validation_error | trim == '' and op == 'temperature' }}"
+            sequence:
+              - action: climate.set_temperature
+                target:
+                  entity_id: "{{ target_id }}"
+                data:
+                  temperature: "{{ requested_value | int / 1000 }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'hvac' }}"
+            sequence:
+              - action: climate.set_hvac_mode
+                target:
+                  entity_id: "{{ target_id }}"
+                data: "{{ {'hvac_mode': requested_setting.value} }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'preset' }}"
+            sequence:
+              - action: climate.set_preset_mode
+                target:
+                  entity_id: "{{ target_id }}"
+                data: "{{ {'preset_mode': requested_setting.value} }}"
+      - variables:
+          response: >-
+            {% set total = room_rows | length %}
+            {% set pages = (total + 3) // 4 %}
+            {% set actual_page = [requested_page, [0, pages - 1] | max] | min %}
+            {{ {
+              'v': 1,
+              'ok': validation_error | trim == '',
+              'error': validation_error | trim,
+              'request_id': request_key,
+              'page': actual_page,
+              'pages': pages,
+              'total': total,
+              'rooms': room_rows[actual_page * 4:actual_page * 4 + 4],
+              'selected': selected_row
+            } }}
+      - stop: Katalog termostatow gotowy
+        response_variable: response
