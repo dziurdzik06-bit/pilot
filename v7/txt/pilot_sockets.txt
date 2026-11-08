@@ -1,0 +1,163 @@
+# Home Assistant Core 2026.11 — gniazda dla pilota ESPHome.
+# Etykiete "Gniazda pilota" przypisuj bezposrednio encjom switch.*.
+# Zapisz jako packages/pilot_sockets.yaml obok pakietow lamp i rolet.
+# Pomiary sa dobierane po urzadzeniu i device_class. Kilka czujnikow tej
+# samej klasy oznacza niejednoznacznosc — nie zgadujemy kanalu listwy.
+# Powiazania reczne (takze czujnikow szablonowych) wpisz w measurement_overrides.
+# Jednostki sa przekazywane bez przeliczania; brak odczytu nie oznacza zera.
+script:
+  pilot_sockets:
+    alias: Pilot — gniazda
+    description: Katalog i sterowanie gniazdami z etykieta Gniazda pilota.
+    mode: queued
+    max: 8
+    fields:
+      operation:
+        name: Operacja
+        default: catalog
+        selector:
+          select:
+            options: [catalog, toggle, "on", "off"]
+      entity_id:
+        name: Encja gniazda
+        default: ""
+        selector:
+          entity:
+            domain: switch
+      page:
+        name: Strona od zera
+        default: 0
+        selector:
+          number: {min: 0, max: 10000, mode: box}
+      request_id:
+        name: Identyfikator zadania
+        default: 0
+        selector:
+          number: {min: 0, max: 4294967295, mode: box}
+    sequence:
+      - variables:
+          # Przyklad:
+          # measurement_overrides:
+          #   switch.biurko:
+          #     power: sensor.biurko_moc
+          #     energy: sensor.biurko_energia
+          # Jawny, bledny wpis nie uruchamia doboru automatycznego dla tej klasy.
+          measurement_overrides: {}
+          op: "{{ operation | default('catalog', true) | string | trim | lower }}"
+          target_id: "{{ entity_id | default('', true) | string | trim }}"
+          label_key: "{{ label_id('Gniazda pilota') }}"
+          requested_page: >-
+            {% set raw_page = page | default(0) %}
+            {{ [0, raw_page | int(0)] | max if raw_page is not boolean and is_number(raw_page) else 0 }}
+          request_key: "{{ request_id | int(0) if request_id is defined and request_id is not boolean and is_number(request_id) else 0 }}"
+          raw_request_key: "{{ request_id | default(0) }}"
+          measurement_classes: [power, current, voltage, energy]
+      - variables:
+          member_ids: >-
+            {{ (label_entities(label_key) if label_key else [])
+               | select('match', '^switch\\.[a-z0-9_]{1,248}$') | unique | list }}
+      - variables:
+          validation_error: >-
+            {% if not label_key %}
+              Brak etykiety Gniazda pilota
+            {% elif op not in ['catalog', 'toggle', 'on', 'off'] %}
+              Nieznana operacja
+            {% elif raw_request_key is boolean or not is_number(raw_request_key)
+                      or raw_request_key | float != request_key
+                      or request_key < 0 or request_key > 4294967295 %}
+              Bledny identyfikator zadania
+            {% elif op != 'catalog' and target_id not in member_ids %}
+              Gniazdo poza etykieta
+            {% elif op != 'catalog' and states(target_id) not in ['on', 'off'] %}
+              Gniazdo niedostepne
+            {% endif %}
+      - choose:
+          - conditions: "{{ validation_error | trim == '' and op == 'toggle' }}"
+            sequence:
+              - action: switch.toggle
+                target:
+                  entity_id: "{{ target_id }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'on' }}"
+            sequence:
+              - action: switch.turn_on
+                target:
+                  entity_id: "{{ target_id }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'off' }}"
+            sequence:
+              - action: switch.turn_off
+                target:
+                  entity_id: "{{ target_id }}"
+      - variables:
+          response: >-
+            {% set ns = namespace(rows=[]) %}
+            {% for eid in member_ids %}
+              {% set s = states(eid) %}
+              {% set device = device_id(eid) %}
+              {% set sensors = (device_entities(device) if device else [])
+                 | select('match', '^sensor\\.[a-z0-9_]{1,248}$') | unique | list %}
+              {% set overrides = measurement_overrides[eid]
+                 if measurement_overrides is mapping and eid in measurement_overrides else {} %}
+              {% set telemetry = namespace(values={}, ambiguous=[]) %}
+              {% for kind in measurement_classes %}
+                {% set candidates = namespace(ids=[]) %}
+                {% for sensor in sensors %}
+                  {% if state_attr(sensor, 'device_class') == kind %}
+                    {% set candidates.ids = candidates.ids + [sensor] %}
+                  {% endif %}
+                {% endfor %}
+                {% set source = namespace(id=none) %}
+                {% if overrides is mapping and kind in overrides %}
+                  {% set override_id = overrides[kind] %}
+                  {% if override_id is string
+                        and override_id is match('^sensor\\.[a-z0-9_]{1,248}$')
+                        and state_attr(override_id, 'device_class') == kind %}
+                    {% set source.id = override_id %}
+                  {% endif %}
+                {% elif overrides is mapping and candidates.ids | length == 1 %}
+                  {% set source.id = candidates.ids[0] %}
+                {% endif %}
+                {% if source.id is none and candidates.ids | length > 1 %}
+                  {% set telemetry.ambiguous = telemetry.ambiguous + [kind] %}
+                {% endif %}
+                {% set reading = none %}
+                {% if source.id is not none %}
+                  {% set raw_value = states(source.id) %}
+                  {% set usable = raw_value is not boolean and is_number(raw_value) %}
+                  {% set raw_unit = state_attr(source.id, 'unit_of_measurement') %}
+                  {% set reading = {
+                    'entity_id': source.id,
+                    'value': raw_value | float if usable else none,
+                    'unit': raw_unit[:12] if raw_unit is string else '',
+                    'available': usable
+                  } %}
+                {% endif %}
+                {% set telemetry.values = dict(telemetry.values, **{kind: reading}) %}
+              {% endfor %}
+              {% set row = {
+                'id': eid,
+                'name': (state_attr(eid, 'friendly_name') or eid) | string | truncate(80, true, '', 0),
+                'on': s == 'on',
+                'available': s in ['on', 'off'],
+                'measurements': telemetry.values,
+                'ambiguous': telemetry.ambiguous
+              } %}
+              {% set ns.rows = ns.rows + [row] %}
+            {% endfor %}
+            {% set rows = ns.rows | sort(attribute='id') | sort(attribute='name', case_sensitive=false) %}
+            {% set total = rows | length %}
+            {% set pages = (total + 3) // 4 %}
+            {% set actual_page = [requested_page, [0, pages - 1] | max] | min %}
+            {% set selected = rows | selectattr('id','eq',target_id) | first | default(none) %}
+            {{ {
+              'v': 1,
+              'ok': validation_error | trim == '',
+              'error': validation_error | trim,
+              'request_id': request_key,
+              'page': actual_page,
+              'pages': pages,
+              'total': total,
+              'sockets': rows[actual_page * 4:actual_page * 4 + 4],
+              'selected': selected
+            } }}
+      - stop: Katalog gniazd gotowy
+        response_variable: response

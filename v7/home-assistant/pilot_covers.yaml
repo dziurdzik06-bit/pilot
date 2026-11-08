@@ -1,0 +1,190 @@
+# Home Assistant Core 2026.11 — rolety dla pilota ESPHome.
+# Etykiete "Rolety pilota" przypisuj bezposrednio encjom cover.*.
+# Zapisz jako packages/pilot_covers.yaml obok pakietu pilot_lights.yaml.
+# Endpoint script.pilot_covers; 0% = zamkniete, 100% = otwarte.
+# Bity funkcji: HA 2026.11.0 homeassistant/components/cover/const.py.
+# Nieznany stan nie odbiera jawnych funkcji mostka RF; unavailable blokuje ruch.
+script:
+  pilot_covers:
+    alias: Pilot — rolety
+    description: Katalog i sterowanie roletami z etykieta Rolety pilota.
+    mode: queued
+    max: 8
+    fields:
+      operation:
+        name: Operacja
+        default: catalog
+        selector:
+          select:
+            options: [catalog, open, close, stop, position, tilt, tilt_open, tilt_close, tilt_stop]
+      entity_id:
+        name: Encja rolety
+        default: ""
+        selector:
+          entity:
+            domain: cover
+      page:
+        name: Strona od zera
+        default: 0
+        selector:
+          number: {min: 0, max: 10000, mode: box}
+      value:
+        name: Otwarcie lub pochylenie procent
+        default: 0
+        selector:
+          number: {min: 0, max: 100, step: 1, mode: box}
+      request_id:
+        name: Identyfikator zadania
+        default: 0
+        selector:
+          number: {min: 0, max: 4294967295, mode: box}
+    sequence:
+      - variables:
+          op: "{{ operation | default('catalog', true) | string | trim | lower }}"
+          target_id: "{{ entity_id | default('', true) | string | trim }}"
+          label_key: "{{ label_id('Rolety pilota') }}"
+          requested_page: >-
+            {% set raw_page = page | default(0) %}
+            {{ [0, raw_page | int(0)] | max if raw_page is not boolean and is_number(raw_page) else 0 }}
+          request_key: "{{ request_id | int(0) if request_id is defined and request_id is not boolean and is_number(request_id) else 0 }}"
+          raw_request_key: "{{ request_id | default(0) }}"
+          requested_value: "{{ value | default(none) }}"
+          known_states: [open, closed, opening, closing, unknown, unavailable]
+          available_states: [open, closed, opening, closing]
+          operation_bits:
+            open: 1
+            close: 2
+            position: 4
+            stop: 8
+            tilt_open: 16
+            tilt_close: 32
+            tilt_stop: 64
+            tilt: 128
+      - variables:
+          member_ids: >-
+            {{ (label_entities(label_key) if label_key else [])
+               | select('match', '^cover\\.') | unique | list }}
+          raw_target_features: "{{ state_attr(target_id, 'supported_features') if target_id in member_ids else none }}"
+      - variables:
+          target_features: >-
+            {{ raw_target_features | int if raw_target_features is not boolean
+               and is_number(raw_target_features)
+               and raw_target_features | float == raw_target_features | int
+               and 0 <= raw_target_features | float <= 4294967295 else 0 }}
+      - variables:
+          validation_error: >-
+            {% if not label_key %}
+              Brak etykiety Rolety pilota
+            {% elif op != 'catalog' and op not in operation_bits %}
+              Nieznana operacja
+            {% elif raw_request_key is boolean or not is_number(raw_request_key)
+                      or raw_request_key | float != request_key
+                      or request_key < 0 or request_key > 4294967295 %}
+              Bledny identyfikator zadania
+            {% elif op != 'catalog' and target_id not in member_ids %}
+              Roleta poza etykieta
+            {% elif op != 'catalog' and states(target_id) not in available_states
+                      and not (states(target_id) == 'unknown' and target_features > 0) %}
+              Roleta niedostepna
+            {% elif op != 'catalog' and (target_features // operation_bits[op]) % 2 != 1 %}
+              Brak obslugi tej funkcji
+            {% elif op in ['position','tilt'] %}
+              {% if requested_value is boolean or not is_number(requested_value)
+                    or requested_value | float != requested_value | int
+                    or requested_value | float < 0 or requested_value | float > 100 %}
+                Procent poza zakresem
+              {% endif %}
+            {% endif %}
+      - choose:
+          - conditions: "{{ validation_error | trim == '' and op == 'open' }}"
+            sequence:
+              - action: cover.open_cover
+                target:
+                  entity_id: "{{ target_id }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'close' }}"
+            sequence:
+              - action: cover.close_cover
+                target:
+                  entity_id: "{{ target_id }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'stop' }}"
+            sequence:
+              - action: cover.stop_cover
+                target:
+                  entity_id: "{{ target_id }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'position' }}"
+            sequence:
+              - action: cover.set_cover_position
+                target:
+                  entity_id: "{{ target_id }}"
+                data:
+                  position: "{{ requested_value | int }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'tilt' }}"
+            sequence:
+              - action: cover.set_cover_tilt_position
+                target:
+                  entity_id: "{{ target_id }}"
+                data:
+                  tilt_position: "{{ requested_value | int }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'tilt_open' }}"
+            sequence:
+              - action: cover.open_cover_tilt
+                target:
+                  entity_id: "{{ target_id }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'tilt_close' }}"
+            sequence:
+              - action: cover.close_cover_tilt
+                target:
+                  entity_id: "{{ target_id }}"
+          - conditions: "{{ validation_error | trim == '' and op == 'tilt_stop' }}"
+            sequence:
+              - action: cover.stop_cover_tilt
+                target:
+                  entity_id: "{{ target_id }}"
+      - variables:
+          response: >-
+            {% set ns = namespace(rows=[]) %}
+            {% for eid in member_ids %}
+              {% set s = states(eid) %}
+              {% set raw_features = state_attr(eid, 'supported_features') %}
+              {% set features = raw_features | int if raw_features is not boolean
+                                and is_number(raw_features)
+                                and raw_features | float == raw_features | int
+                                and 0 <= raw_features | float <= 4294967295 else 0 %}
+              {% set position = state_attr(eid, 'current_position') %}
+              {% set tilt = state_attr(eid, 'current_tilt_position') %}
+              {% set row = {
+                'id': eid,
+                'name': (state_attr(eid, 'friendly_name') or eid) | string | truncate(80, true, ''),
+                'state': s if s in known_states else 'unknown',
+                'available': s in available_states or (s == 'unknown' and features > 0),
+                'position': position | float if position is not boolean and is_number(position) and 0 <= position | float <= 100 else none,
+                'tilt': tilt | float if tilt is not boolean and is_number(tilt) and 0 <= tilt | float <= 100 else none,
+                'can_open': (features // 1) % 2 == 1,
+                'can_close': (features // 2) % 2 == 1,
+                'can_stop': (features // 8) % 2 == 1,
+                'can_position': (features // 4) % 2 == 1,
+                'can_tilt': (features // 128) % 2 == 1,
+                'can_tilt_open': (features // 16) % 2 == 1,
+                'can_tilt_close': (features // 32) % 2 == 1,
+                'can_tilt_stop': (features // 64) % 2 == 1
+              } %}
+              {% set ns.rows = ns.rows + [row] %}
+            {% endfor %}
+            {% set rows = ns.rows | sort(attribute='id') | sort(attribute='name', case_sensitive=false) %}
+            {% set total = rows | length %}
+            {% set pages = (total + 3) // 4 %}
+            {% set actual_page = [requested_page, [0, pages - 1] | max] | min %}
+            {% set selected = rows | selectattr('id','eq',target_id) | first | default(none) %}
+            {{ {
+              'v': 1,
+              'ok': validation_error | trim == '',
+              'error': validation_error | trim,
+              'request_id': request_key,
+              'page': actual_page,
+              'pages': pages,
+              'total': total,
+              'covers': rows[actual_page * 4:actual_page * 4 + 4],
+              'selected': selected
+            } }}
+      - stop: Katalog rolet gotowy
+        response_variable: response
